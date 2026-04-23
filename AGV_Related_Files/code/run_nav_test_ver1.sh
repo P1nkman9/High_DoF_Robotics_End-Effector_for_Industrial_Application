@@ -8,9 +8,9 @@
 source /opt/ros/noetic/setup.bash
 source ~/myagv_ros/devel/setup.bash
 
-# ── 网络模式选择 ─────────────────────────────────────────────────────
-# 默认: AGV 单独运行 (localhost)
-# 连接 Jetson 时: ./run_nav_test_ver1.sh jetson
+# ── Network mode selection ───────────────────────────────────────────
+# Default: AGV stand-alone (localhost)
+# When connecting to Jetson: ./run_nav_test_ver1.sh jetson
 if [[ "$1" == "jetson" ]]; then
     export ROS_MASTER_URI=http://192.168.1.10:11311
     export ROS_IP=192.168.1.10
@@ -29,7 +29,7 @@ echo "   Starting Nav Test v1 Environment"
 echo "   (SSH compatible - no gnome-terminal)"
 echo "======================================"
 
-# ===== 0. 启动 roscore =====
+# ===== 0. Start roscore =====
 echo "[0/5] Starting roscore..."
 roscore > "$LOG_DIR/roscore.log" 2>&1 &
 PID_ROSCORE=$!
@@ -49,7 +49,7 @@ for i in $(seq 1 15); do
     sleep 1
 done
 
-# ===== 1. 启动雷达 =====
+# ===== 1. Start LiDAR =====
 echo "[1/5] Starting YDLidar..."
 cd ~/myagv_ros/src/myagv_odometry/scripts
 ./start_ydlidar.sh > "$LOG_DIR/ydlidar.log" 2>&1 &
@@ -57,25 +57,25 @@ PID_LIDAR=$!
 cd ~
 sleep 5
 
-# ===== 2. 启动底盘 =====
+# ===== 2. Start AGV base =====
 echo "[2/5] Starting AGV base..."
 roslaunch myagv_odometry myagv_active.launch > "$LOG_DIR/agv_base.log" 2>&1 &
 PID_BASE=$!
 sleep 5
 
-# ===== 3. 启动 SLAM =====
+# ===== 3. Start SLAM =====
 echo "[3/5] Starting SLAM..."
 roslaunch myagv_navigation myagv_slam_laser.launch > "$LOG_DIR/slam.log" 2>&1 &
 PID_SLAM=$!
 sleep 8
 
-# ===== 4. 启动 move_base =====
+# ===== 4. Start move_base =====
 echo "[4/5] Starting move_base..."
 roslaunch myagv_navigation exploration_nav.launch > "$LOG_DIR/move_base.log" 2>&1 &
 PID_MOVEBASE=$!
 sleep 5
 
-# ===== 5. 设置参数并启动 nav_test_ver1.py =====
+# ===== 5. Set parameters and start nav_test_ver1.py =====
 echo "[5/5] Starting nav_test_ver1.py..."
 rosparam set /nav_explore/forward_speed 0.08
 rosparam set /nav_explore/turn_speed 0.45
@@ -98,7 +98,7 @@ rosparam set /nav_explore/seek_timeout 35.0
 rosparam set /nav_explore/min_seek_rotation 1.047
 rosparam set /nav_explore/post_turn_frames 20
 
-# ── 新增参数（弯道检测 / 平滑 / 速度耦合） ─────────────────────────
+# ── Added parameters (bend detection / smoothing / speed coupling) ──
 rosparam set /nav_explore/bend_side_thresh 0.80
 rosparam set /nav_explore/bend_steer_gain 0.40
 rosparam set /nav_explore/front_ema_alpha 0.35
@@ -112,7 +112,7 @@ rosparam set /nav_explore/split_delta_eps 0.0015
 rosparam set /nav_explore/split_speed_floor 0.006
 rosparam set /nav_explore/split_cooldown_secs 1.5
 
-# ── 贴墙恢复参数 ────────────────────────────────────────────────────
+# ── Wall-clearance recovery parameters ─────────────────────────────
 rosparam set /nav_explore/recovery_clearance 0.35
 rosparam set /nav_explore/recovery_back_speed 0.05
 rosparam set /nav_explore/recovery_max_secs 5.0
@@ -149,7 +149,7 @@ echo ""
 echo "Press q to stop robot and shut everything down."
 echo "======================================"
 
-# ===== 按 q 退出 =====
+# ===== Press q to exit =====
 while true
 do
     read -n 1 key

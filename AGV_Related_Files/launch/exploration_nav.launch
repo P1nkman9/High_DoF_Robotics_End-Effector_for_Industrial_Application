@@ -1,0 +1,29 @@
+<launch>
+  <!-- move_base general params -->
+  <rosparam file="$(find myagv_navigation)/param/base_local_planner_param/move_base_params.yaml"
+            command="load"
+            ns="move_base" />
+
+  <!-- costmap general params -->
+  <rosparam file="$(find myagv_navigation)/param/base_local_planner_param/costmap_common_params.yaml"
+            command="load"
+            ns="move_base/global_costmap" />
+  <rosparam file="$(find myagv_navigation)/param/base_local_planner_param/costmap_common_params.yaml"
+            command="load"
+            ns="move_base/local_costmap" />
+
+  <!-- exploration global/local costmap -->
+  <rosparam file="$(find myagv_navigation)/param/base_local_planner_param/explore_global_costmap_params.yaml"
+            command="load"
+            ns="move_base/global_costmap" />
+  <rosparam file="$(find myagv_navigation)/param/base_local_planner_param/explore_local_costmap_params.yaml"
+            command="load"
+            ns="move_base/local_costmap" />
+
+  <!-- local planner params -->
+  <rosparam file="$(find myagv_navigation)/param/base_local_planner_param/base_local_planner_params.yaml"
+            command="load"
+            ns="move_base" />
+
+  <node pkg="move_base" type="move_base" name="move_base" output="screen"/>
+</launch>

@@ -2,8 +2,12 @@
 # -*- coding: utf-8 -*-
 
 """
-Jetson single/dual-axis adaptive visual servoing and capture script (TensorRT edition)
-Runs TRT inference for Crack and Erosion; drives gimbal to centre target then captures up to 3 photos
+Adaptive single/dual-axis visual servoing on Jetson. Runs the erosion-seg
+and crack-det TRT engines per frame, centres the highest-priority target
+in the image, and saves the best of up to 3 photos taken while locked.
+
+The first serial port found is assumed to be the yaw axis; if a second is
+present, it drives pitch.
 """
 
 import serial
@@ -24,27 +28,27 @@ KP_PITCH = 0.0005
 DIR_YAW = 1
 DIR_PITCH = 1
 
-# Yaw axis limits (measured: front=0.3, left=-1.4, right=2.0)
+# Measured yaw travel: front=0.3, left=-1.4, right=2.0 (rad).
 YAW_MIN = -1.4
 YAW_MAX = 2.0
-YAW_INIT = 0.3      # move to front-facing position on startup
+YAW_INIT = 0.3
 
-# Pitch axis limits (measured: level=2.8, max upward tilt=2.4)
-PITCH_MIN = 2.4     # highest (upward)
-PITCH_MAX = 3.2     # lowest (downward tilt)
-PITCH_INIT = 2.8    # move to level position on startup
+# Measured pitch travel: level=2.8, max upward tilt=2.4 (rad).
+PITCH_MIN = 2.4
+PITCH_MAX = 3.2
+PITCH_INIT = 2.8
 
-DEADZONE      = 30  # pixels from centre — within this = locked on target
-UNLOCK_FRAMES = 5  # consecutive frames outside deadzone required to end a lock session
+DEADZONE      = 30    # pixels from image centre counted as "locked"
+UNLOCK_FRAMES = 5     # frames outside the deadzone before a lock ends
 
 SAVE_DIR = "erosion_crack_records"
-MAX_PHOTOS_PER_LOCK = 3   # max photos captured per lock session
-PHOTO_INTERVAL    = 1.0   # minimum seconds between shots within a session
+MAX_PHOTOS_PER_LOCK = 3
+PHOTO_INTERVAL    = 1.0
 
-# 类别颜色字典 (OpenCV 使用 BGR 格式)
+# BGR colours used to annotate detections.
 CLASS_COLORS = {
-    "erosion": (0, 255, 0),  # 绿色
-    "crack": (0, 0, 255),    # 红色
+    "erosion": (0, 255, 0),
+    "crack": (0, 0, 255),
 }
 
 # ================= TensorRT Model =================
@@ -325,7 +329,7 @@ def postprocess_det(outs, orig_shape, r, pad):
 
     return mapped, final_scores, final_cls
 
-# ================= 核心追踪程序 =================
+# ================= Core tracking program =================
 
 def find_stm32_ports():
     print("Scanning for STM32 devices...")
@@ -333,7 +337,7 @@ def find_stm32_ports():
     return ports
 
 def run_yolo_inference(color_image, seg_runner, det_runner):
-    """Run both TRT models; return the highest-priority detection (crack > erosion)."""
+    """Run both engines and return the highest-priority hit (crack > erosion)."""
     h0, w0 = color_image.shape[:2]
 
     img_lb, r, pad = letterbox(color_image, (INPUT_H, INPUT_W))
@@ -358,7 +362,7 @@ def run_yolo_inference(color_image, seg_runner, det_runner):
     return None
 
 def _save_best(candidates: list, save_dir: str):
-    """Save the highest-confidence candidate from a lock session; discard the rest."""
+    """Write the highest-confidence frame from one lock session to disk."""
     best_img, best_conf, best_class = max(candidates, key=lambda x: x[1])
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:21]
     filename  = os.path.join(save_dir, f"{best_class}_{timestamp}.jpg")
@@ -372,7 +376,6 @@ def main():
         os.makedirs(SAVE_DIR)
         print(f"[INFO] Created save directory: {SAVE_DIR}/")
 
-    # ================= 1. Load TensorRT engines =================
     print("\n[INFO] Initialising TensorRT engines...")
     try:
         seg_runner = TRTRunner(ENGINE_SEG)
@@ -382,7 +385,6 @@ def main():
         print(f"[ERROR] Failed to load TensorRT engine: {e}")
         return
 
-    # ================= 2. Connect gimbal (single/dual motor adaptive) =================
     ports = find_stm32_ports()
     if len(ports) == 0:
         print("[ERROR] No STM32 device found. Please connect at least one.")
@@ -424,7 +426,6 @@ def main():
     current_yaw   = YAW_INIT
     current_pitch = PITCH_INIT
 
-    # ================= 3. Start camera =================
     print("[INFO] Starting D435 colour stream...")
     pipeline = rs.pipeline()
     config = rs.config()
@@ -439,11 +440,11 @@ def main():
     CENTER_X = 640 / 2
     CENTER_Y = 480 / 2
 
-    # Photo-save state
-    photo_candidates   = []    # list of (img_copy, conf, class_name) buffered this session
-    last_capture_time  = 0.0   # time of last candidate captured
+    # Candidate buffer for the current lock session.
+    photo_candidates   = []    # (img_copy, conf, class_name)
+    last_capture_time  = 0.0
     was_locked         = False
-    unlock_frames      = 0     # consecutive frames outside deadzone (must reach UNLOCK_FRAMES to reset)
+    unlock_frames      = 0
 
     print("\n[INFO] System ready. (single/dual motor adaptive)")
 
@@ -470,18 +471,16 @@ def main():
                 err_x = cx - CENTER_X
                 err_y = cy - CENTER_Y
 
-                # Draw bounding box and label (always, so saved image has annotations)
+                # Draw annotations on display_image so the saved frame has them too.
                 cv2.rectangle(display_image, (int(x_min), int(y_min)), (int(x_max), int(y_max)), box_color, 2)
                 label = f"{class_name} {conf:.2f}"
                 cv2.putText(display_image, label, (int(x_min), int(y_min) - 10),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, box_color, 2)
                 cv2.circle(display_image, (int(cx), int(cy)), 5, box_color, -1)
 
-                # ================= Gimbal tracking =================
                 if abs(err_x) > DEADZONE or abs(err_y) > DEADZONE:
                     unlock_frames += 1
                     if was_locked and unlock_frames >= UNLOCK_FRAMES:
-                        # Session ended — save the best candidate collected so far
                         if photo_candidates:
                             _save_best(photo_candidates, SAVE_DIR)
                             photo_candidates = []
@@ -499,8 +498,8 @@ def main():
                     if ser_pitch:
                         ser_pitch.write(f"T{current_pitch:.4f}\n".encode('utf-8'))
 
-                # ================= Auto-capture (locked on target) =================
                 else:
+                    # Locked on target: capture at most MAX_PHOTOS_PER_LOCK frames.
                     unlock_frames = 0
                     was_locked    = True
                     current_time  = time.time()
@@ -510,13 +509,11 @@ def main():
                         last_capture_time = current_time
                         print(f"[CANDIDATE] {len(photo_candidates)}/{MAX_PHOTOS_PER_LOCK} "
                               f"buffered (conf={conf:.3f})")
-                        # All candidates collected — save best immediately
                         if len(photo_candidates) == MAX_PHOTOS_PER_LOCK:
                             _save_best(photo_candidates, SAVE_DIR)
                             photo_candidates = []
-                            was_locked = False  # end session; wait for next lock
+                            was_locked = False
 
-            # Draw centre crosshair
             cv2.line(display_image, (int(CENTER_X)-20, int(CENTER_Y)), (int(CENTER_X)+20, int(CENTER_Y)), (0, 255, 0), 2)
             cv2.line(display_image, (int(CENTER_X), int(CENTER_Y)-20), (int(CENTER_X), int(CENTER_Y)+20), (0, 255, 0), 2)
 

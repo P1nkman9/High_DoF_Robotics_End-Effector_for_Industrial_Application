@@ -2,9 +2,9 @@
 # -*- coding: utf-8 -*-
 
 """
-Pitch-only test variant of visual_servoing_test.py
-Single STM32 connected -> assigned to PITCH motor (up/down tracking).
-All other logic identical to visual_servoing_test.py
+Pitch-first variant of the servoing script. Identical to the yaw variant
+except the first serial port found is treated as the pitch axis so a
+single-motor run exercises only pitch.
 """
 
 import serial
@@ -25,14 +25,14 @@ KP_PITCH = 0.0005
 DIR_YAW = 1
 DIR_PITCH = 1
 
-# Yaw axis limits (measured: front=0.3, left=-1.4, right=2.0)
+# Measured yaw travel: front=0.3, left=-1.4, right=2.0 (rad).
 YAW_MIN = -1.4
 YAW_MAX = 2.0
 YAW_INIT = 0.3
 
-# Pitch axis limits (measured: level=2.8, max upward tilt=2.4)
+# Measured pitch travel: level=2.8, max upward tilt=2.4 (rad).
 PITCH_MIN = 2.4
-PITCH_MAX = 3.2     # lowest (downward tilt)
+PITCH_MAX = 3.2
 PITCH_INIT = 2.8
 
 DEADZONE      = 30
@@ -306,7 +306,7 @@ def find_stm32_ports():
             if 'ACM' in p.device or 'USB' in p.device]
 
 def run_yolo_inference(color_image, seg_runner, det_runner):
-    """Run both TRT models; return the highest-priority detection (crack > erosion)."""
+    """Run both engines and return the highest-priority hit (crack > erosion)."""
     h0, w0 = color_image.shape[:2]
     img_lb, r, pad = letterbox(color_image, (INPUT_H, INPUT_W))
     img_rgb = cv2.cvtColor(img_lb, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
@@ -358,7 +358,7 @@ def main():
     ser_pitch = None
 
     try:
-        # ---- KEY DIFFERENCE: single motor -> PITCH, not YAW ----
+        # Pitch-first mapping: first port is pitch, second (if any) is yaw.
         if len(ports) >= 1:
             ser_pitch = serial.Serial(ports[0], 115200, timeout=0.1)
             print(f"--> [PITCH motor] connected to {ports[0]}")

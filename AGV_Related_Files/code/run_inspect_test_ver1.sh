@@ -8,9 +8,9 @@
 source /opt/ros/noetic/setup.bash
 source ~/myagv_ros/devel/setup.bash
 
-# ── 网络模式选择 ─────────────────────────────────────────────────────
-# 默认: AGV 单独运行 (localhost)
-# 连接 Jetson 时: ./run_inspect_test_ver1.sh jetson
+# ── Network mode selection ───────────────────────────────────────────
+# Default: AGV stand-alone (localhost)
+# When connecting to Jetson: ./run_inspect_test_ver1.sh jetson
 if [[ "$1" == "jetson" ]]; then
     export ROS_MASTER_URI=http://192.168.1.10:11311
     export ROS_IP=192.168.1.10
@@ -29,7 +29,7 @@ echo "   Starting Inspect Patrol Environment"
 echo "   (SSH compatible - no gnome-terminal)"
 echo "======================================"
 
-# ===== 0. 启动 roscore =====
+# ===== 0. Start roscore =====
 echo "[0/5] Starting roscore..."
 roscore > "$LOG_DIR/roscore.log" 2>&1 &
 PID_ROSCORE=$!
@@ -64,7 +64,7 @@ if [ ! -f "$DEFECT_YAML" ]; then
     echo "The robot will navigate to start and back with no inspections."
 fi
 
-# ===== 1. 启动雷达 =====
+# ===== 1. Start LiDAR =====
 echo "[1/5] Starting YDLidar..."
 cd ~/myagv_ros/src/myagv_odometry/scripts
 ./start_ydlidar.sh > "$LOG_DIR/ydlidar.log" 2>&1 &
@@ -72,25 +72,25 @@ PID_LIDAR=$!
 cd ~
 sleep 5
 
-# ===== 2. 启动底盘 =====
+# ===== 2. Start AGV base =====
 echo "[2/5] Starting AGV base..."
 roslaunch myagv_odometry myagv_active.launch > "$LOG_DIR/agv_base.log" 2>&1 &
 PID_BASE=$!
 sleep 5
 
-# ===== 3. 启动 map_server + AMCL 定位 =====
+# ===== 3. Start map_server + AMCL localization =====
 echo "[3/5] Starting map_server + AMCL..."
 roslaunch myagv_navigation navigation_active.launch map:=$MAP_YAML > "$LOG_DIR/amcl.log" 2>&1 &
 PID_AMCL=$!
 sleep 8
 
-# ===== 4. 启动 move_base =====
+# ===== 4. Start move_base =====
 echo "[4/5] Starting move_base..."
 roslaunch myagv_navigation exploration_nav.launch > "$LOG_DIR/move_base.log" 2>&1 &
 PID_MOVEBASE=$!
 sleep 5
 
-# ===== 5. 启动 inspect_test_ver1.py =====
+# ===== 5. Start inspect_test_ver1.py =====
 echo "[5/5] Starting inspect_test_ver1.py..."
 rosparam set /inspect_patrol/defect_yaml $DEFECT_YAML
 rosparam set /inspect_patrol/goal_timeout 120.0
@@ -117,7 +117,7 @@ echo ""
 echo "Press q to stop robot and shut everything down."
 echo "======================================"
 
-# ===== 按 q 退出 =====
+# ===== Press q to exit =====
 while true
 do
     read -n 1 key
