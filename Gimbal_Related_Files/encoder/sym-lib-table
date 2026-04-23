@@ -1,0 +1,4 @@
+(sym_lib_table
+  (version 0)
+  (lib (name "Magnetic_Encoder-altium-import")(type "KiCad")(uri "${KIPRJMOD}/Magnetic_Encoder-altium-import.kicad_sym")(options "")(descr ""))
+)
