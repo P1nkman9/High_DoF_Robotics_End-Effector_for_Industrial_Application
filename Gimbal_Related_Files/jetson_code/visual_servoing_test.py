@@ -2,9 +2,12 @@
 # -*- coding: utf-8 -*-
 
 """
-Pitch-first variant of the servoing script. Identical to the yaw variant
-except the first serial port found is treated as the pitch axis so a
-single-motor run exercises only pitch.
+Adaptive single/dual-axis visual servoing on Jetson. Runs the erosion-seg
+and crack-det TRT engines per frame, centres the highest-priority target
+in the image, and saves the best of up to 3 photos taken while locked.
+
+The first serial port found is assumed to be the yaw axis; if a second is
+present, it drives pitch.
 """
 
 import serial
@@ -35,32 +38,34 @@ PITCH_MIN = 2.4
 PITCH_MAX = 3.2
 PITCH_INIT = 2.8
 
-DEADZONE      = 30
-UNLOCK_FRAMES = 5
+DEADZONE      = 30    # pixels from image centre counted as "locked"
+UNLOCK_FRAMES = 5     # frames outside the deadzone before a lock ends
 
 SAVE_DIR = "erosion_crack_records"
 MAX_PHOTOS_PER_LOCK = 3
-PHOTO_INTERVAL      = 1.0
+PHOTO_INTERVAL    = 1.0
 
+# BGR colours used to annotate detections.
 CLASS_COLORS = {
     "erosion": (0, 255, 0),
-    "crack":   (0, 0, 255),
+    "crack": (0, 0, 255),
 }
 
 # ================= TensorRT Model =================
 LIBCUDART_PATH = "/usr/local/cuda-10.2/targets/aarch64-linux/lib/libcudart.so.10.2"
-ENGINE_SEG = "/home/fyp/robot_project/defect_detection/erosion_fp16.engine"
-ENGINE_DET = "/home/fyp/robot_project/defect_detection/crack_fp16.engine"
+ENGINE_SEG = "/home/fyp/robot_project/defect_detection/erosion_fp16.engine"   # erosion seg
+ENGINE_DET = "/home/fyp/robot_project/defect_detection/crack_fp16.engine"    # crack det
 
 INPUT_W = 640
 INPUT_H = 640
 
-CONF_DET   = 0.25
-CONF_SEG   = 0.25
-IOU_THRESH  = 0.50
+CONF_DET = 0.25
+CONF_SEG = 0.25
+IOU_THRESH = 0.50
 MASK_THRESH = 0.50
+# =====================================================
 
-# ---------- CUDA Runtime ----------
+# ---------- CUDA Runtime (cudart) ----------
 _libcudart = ctypes.CDLL(LIBCUDART_PATH)
 cudaMemcpyHostToDevice = 1
 cudaMemcpyDeviceToHost = 2
@@ -69,22 +74,22 @@ def _check(status, msg):
     if status != 0:
         raise RuntimeError(f"{msg} (cudaError={status})")
 
-def cuda_malloc(nbytes):
+def cuda_malloc(nbytes: int) -> int:
     ptr = ctypes.c_void_p()
     _check(_libcudart.cudaMalloc(ctypes.byref(ptr), nbytes), "cudaMalloc failed")
     return ptr.value
 
-def cuda_free(ptr):
+def cuda_free(ptr: int):
     _check(_libcudart.cudaFree(ctypes.c_void_p(ptr)), "cudaFree failed")
 
-def cuda_memcpy(dst, src, nbytes, kind):
-    _check(_libcudart.cudaMemcpy(ctypes.c_void_p(dst), ctypes.c_void_p(src), nbytes, kind),
+def cuda_memcpy(dst_ptr: int, src_ptr: int, nbytes: int, kind: int):
+    _check(_libcudart.cudaMemcpy(ctypes.c_void_p(dst_ptr), ctypes.c_void_p(src_ptr), nbytes, kind),
            "cudaMemcpy failed")
 
-def cuda_memcpy_htod(dst_dev, src_host):
+def cuda_memcpy_htod(dst_dev: int, src_host: np.ndarray):
     cuda_memcpy(dst_dev, src_host.ctypes.data, src_host.nbytes, cudaMemcpyHostToDevice)
 
-def cuda_memcpy_dtoh(dst_host, src_dev):
+def cuda_memcpy_dtoh(dst_host: np.ndarray, src_dev: int):
     cuda_memcpy(dst_host.ctypes.data, src_dev, dst_host.nbytes, cudaMemcpyDeviceToHost)
 
 # ---------- Utils ----------
@@ -96,9 +101,9 @@ def letterbox(im, new_shape=(640, 640), color=(114, 114, 114)):
     im2 = cv2.resize(im, resized, interpolation=cv2.INTER_LINEAR)
     padw = nw - resized[0]
     padh = nh - resized[1]
-    left   = int(round(padw / 2 - 0.1))
-    right  = int(round(padw / 2 + 0.1))
-    top    = int(round(padh / 2 - 0.1))
+    left = int(round(padw / 2 - 0.1))
+    right = int(round(padw / 2 + 0.1))
+    top = int(round(padh / 2 - 0.1))
     bottom = int(round(padh / 2 + 0.1))
     im3 = cv2.copyMakeBorder(im2, top, bottom, left, right, cv2.BORDER_CONSTANT, value=color)
     return im3, r, (left, top)
@@ -136,11 +141,11 @@ def nms(boxes, scores, iou_thres):
         idxs = idxs[1:][ious < iou_thres]
     return keep
 
-# ---------- TRT Runner ----------
+# ---------- Generic TRT runner ----------
 class TRTRunner:
-    def __init__(self, engine_path):
+    def __init__(self, engine_path: str):
         print(f"[INFO] Loading TRT engine: {engine_path}")
-        logger  = trt.Logger(trt.Logger.WARNING)
+        logger = trt.Logger(trt.Logger.WARNING)
         runtime = trt.Runtime(logger)
         with open(engine_path, "rb") as f:
             self.engine = runtime.deserialize_cuda_engine(f.read())
@@ -156,32 +161,34 @@ class TRTRunner:
                 self.in_idxs.append(i)
             else:
                 self.out_idxs.append(i)
-
-        self.in_idx  = self.in_idxs[0]
+        
+        self.in_idx = self.in_idxs[0]
         self.in_name = self.engine.get_binding_name(self.in_idx)
 
         in_shape = tuple(self.context.get_binding_shape(self.in_idx))
         if -1 in in_shape:
             self.context.set_binding_shape(self.in_idx, (1, 3, INPUT_H, INPUT_W))
 
-        self.h = {}
-        self.d = {}
+        self.h = {}          
+        self.d = {}          
         self.bindings = [0] * self.engine.num_bindings
+
         for i in range(self.engine.num_bindings):
-            name  = self.engine.get_binding_name(i)
+            name = self.engine.get_binding_name(i)
             shape = tuple(self.context.get_binding_shape(i))
-            host  = np.empty(shape, dtype=np.float32)
-            dev   = cuda_malloc(host.nbytes)
+            host = np.empty(shape, dtype=np.float32)
+            dev = cuda_malloc(host.nbytes)
             self.h[name] = host
             self.d[name] = dev
             self.bindings[i] = dev
 
         self.out_names = [self.engine.get_binding_name(i) for i in self.out_idxs]
 
-    def infer(self, input_chw):
+    def infer(self, input_chw: np.ndarray):
         np.copyto(self.h[self.in_name], input_chw)
         cuda_memcpy_htod(self.d[self.in_name], self.h[self.in_name])
-        if not self.context.execute_v2(self.bindings):
+        ok = self.context.execute_v2(self.bindings)
+        if not ok:
             raise RuntimeError("TensorRT execute_v2 failed")
         outs = {}
         for name in self.out_names:
@@ -196,9 +203,10 @@ class TRTRunner:
         except Exception:
             pass
 
-# ---------- Postprocess ----------
+# ---------- Postprocess Functions ----------
 def postprocess_seg(outs, orig_shape, r, pad):
-    det = proto = None
+    det = None
+    proto = None
     for k, v in outs.items():
         if v.ndim == 3 and v.shape[0] == 1 and v.shape[1] >= 6 and v.shape[2] >= 1000:
             det = v
@@ -207,124 +215,154 @@ def postprocess_seg(outs, orig_shape, r, pad):
     if det is None or proto is None:
         return [], [], [], []
 
-    det       = det[0].transpose(1, 0)
+    det = det[0].transpose(1, 0)
     boxes_xywh = det[:, 0:4]
-    scores     = det[:, 4]
-    mask_coef  = det[:, 5:5+32]
+    cls_score = det[:, 4]
+    mask_coef = det[:, 5:5+32]
 
+    scores = cls_score
     keep = scores > CONF_SEG
     if not np.any(keep):
         return [], [], [], []
 
     boxes_xywh = boxes_xywh[keep]
-    scores     = scores[keep]
-    mask_coef  = mask_coef[keep]
+    scores = scores[keep]
+    mask_coef = mask_coef[keep]
 
-    boxes    = xywh2xyxy(boxes_xywh)
+    boxes = xywh2xyxy(boxes_xywh)
     keep_idx = nms(boxes, scores, IOU_THRESH)
-    boxes     = boxes[keep_idx]
-    scores    = scores[keep_idx]
+    boxes = boxes[keep_idx]
+    scores = scores[keep_idx]
     mask_coef = mask_coef[keep_idx]
 
-    proto    = proto[0]
+    proto = proto[0]
     nm, mh, mw = proto.shape
     proto_flat = proto.reshape(nm, -1)
 
-    padw, padh = pad
-    h0, w0 = orig_shape
-    boxes_out, masks_out = [], []
+    masks_640 = []
     for i in range(boxes.shape[0]):
         m = sigmoid(mask_coef[i] @ proto_flat).reshape(mh, mw).astype(np.float32)
         m = cv2.resize(m, (INPUT_W, INPUT_H), interpolation=cv2.INTER_LINEAR)
+        masks_640.append(m)
+
+    padw, padh = pad
+    h0, w0 = orig_shape
+
+    boxes_out, masks_out = [], []
+    for i, m in enumerate(masks_640):
         x1, y1, x2, y2 = boxes[i]
-        x1 = max(0, min(w0-1, (x1-padw)/r))
-        y1 = max(0, min(h0-1, (y1-padh)/r))
-        x2 = max(0, min(w0-1, (x2-padw)/r))
-        y2 = max(0, min(h0-1, (y2-padh)/r))
+        x1 = max(0, min(w0 - 1, (x1 - padw) / r))
+        y1 = max(0, min(h0 - 1, (y1 - padh) / r))
+        x2 = max(0, min(w0 - 1, (x2 - padw) / r))
+        y2 = max(0, min(h0 - 1, (y2 - padh) / r))
         boxes_out.append([x1, y1, x2, y2])
-        x_s, y_s = int(padw), int(padh)
-        x_e, y_e = int(padw + r*w0), int(padh + r*h0)
-        m_orig = cv2.resize(m[y_s:y_e, x_s:x_e], (w0, h0), interpolation=cv2.INTER_LINEAR)
+
+        x_start, y_start = int(padw), int(padh)
+        x_end, y_end = int(padw + r * w0), int(padh + r * h0)
+        m_crop = m[y_start:y_end, x_start:x_end]
+        m_orig = cv2.resize(m_crop, (w0, h0), interpolation=cv2.INTER_LINEAR)
         masks_out.append((m_orig > MASK_THRESH).astype(np.uint8))
 
-    return boxes_out, scores.tolist(), [0]*len(scores), masks_out
+    cls_ids = [0] * len(scores)
+    return boxes_out, scores.tolist(), cls_ids, masks_out
 
-def parse_det_output(out):
+def parse_det_output(out: np.ndarray):
     if out.ndim != 3 or out.shape[0] != 1:
         raise ValueError(f"Unexpected det output shape: {out.shape}")
     _, a, b = out.shape
     if b >= a:
+        N, C = b, a
         pred = out[0].transpose(1, 0)
-        N = b
     else:
+        N, C = a, b
         pred = out[0]
-        N = a
+
     boxes = pred[:, 0:4]
-    rest  = pred[:, 4:]
+    rest = pred[:, 4:]
+
     if rest.shape[1] >= 2:
         obj = rest[:, 0]
         cls_scores = rest[:, 1:]
         if cls_scores.shape[1] >= 1:
-            cid    = np.argmax(cls_scores, axis=1)
-            cls    = cls_scores[np.arange(N), cid]
-            return boxes, obj * cls, cid
-    cid    = np.zeros((N,), dtype=np.int32)
+            cid = np.argmax(cls_scores, axis=1)
+            cls = cls_scores[np.arange(N), cid]
+            scores = obj * cls
+            return boxes, scores, cid
+            
+    cid = np.zeros((N,), dtype=np.int32)
     scores = rest[:, 0] if rest.shape[1] >= 1 else np.zeros((N,), dtype=np.float32)
     return boxes, scores, cid
 
 def postprocess_det(outs, orig_shape, r, pad):
     out = list(outs.values())[0]
     boxes_xywh, scores, cls_ids = parse_det_output(out)
+
     keep = scores > CONF_DET
     if not np.any(keep):
         return [], [], []
+
     boxes_xywh = boxes_xywh[keep]
-    scores     = scores[keep]
-    cls_ids    = cls_ids[keep]
+    scores = scores[keep]
+    cls_ids = cls_ids[keep]
+
     boxes = xywh2xyxy(boxes_xywh)
     final_boxes, final_scores, final_cls = [], [], []
     for cid in np.unique(cls_ids):
         idx = np.where(cls_ids == cid)[0]
-        keep_idx = nms(boxes[idx], scores[idx], IOU_THRESH)
+        b = boxes[idx]
+        s = scores[idx]
+        keep_idx = nms(b, s, IOU_THRESH)
         for k in keep_idx:
-            final_boxes.append(boxes[idx][k])
-            final_scores.append(float(scores[idx][k]))
+            final_boxes.append(b[k])
+            final_scores.append(float(s[k]))
             final_cls.append(int(cid))
+
     padw, padh = pad
     h0, w0 = orig_shape
     mapped = []
     for x1, y1, x2, y2 in final_boxes:
-        mapped.append([max(0, min(w0-1, (x1-padw)/r)),
-                       max(0, min(h0-1, (y1-padh)/r)),
-                       max(0, min(w0-1, (x2-padw)/r)),
-                       max(0, min(h0-1, (y2-padh)/r))])
+        x1 = max(0, min(w0 - 1, (x1 - padw) / r))
+        y1 = max(0, min(h0 - 1, (y1 - padh) / r))
+        x2 = max(0, min(w0 - 1, (x2 - padw) / r))
+        y2 = max(0, min(h0 - 1, (y2 - padh) / r))
+        mapped.append([x1, y1, x2, y2])
+
     return mapped, final_scores, final_cls
+
+# ================= Core tracking program =================
 
 def find_stm32_ports():
     print("Scanning for STM32 devices...")
-    return [p.device for p in serial.tools.list_ports.comports()
-            if 'ACM' in p.device or 'USB' in p.device]
+    ports = [p.device for p in serial.tools.list_ports.comports() if 'ACM' in p.device or 'USB' in p.device]
+    return ports
 
 def run_yolo_inference(color_image, seg_runner, det_runner):
     """Run both engines and return the highest-priority hit (crack > erosion)."""
     h0, w0 = color_image.shape[:2]
+
     img_lb, r, pad = letterbox(color_image, (INPUT_H, INPUT_W))
     img_rgb = cv2.cvtColor(img_lb, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-    inp = np.ascontiguousarray(np.transpose(img_rgb, (2, 0, 1))[None, ...], dtype=np.float32)
+    inp = np.transpose(img_rgb, (2, 0, 1))[None, ...]
+    inp = np.ascontiguousarray(inp, dtype=np.float32)
 
     outs_seg = seg_runner.infer(inp)
     outs_det = det_runner.infer(inp)
 
-    e_boxes, e_scores, _, _ = postprocess_seg(outs_seg, (h0, w0), r, pad)
-    c_boxes, c_scores, _    = postprocess_det(outs_det, (h0, w0), r, pad)
+    e_boxes, e_scores, _, e_masks = postprocess_seg(outs_seg, (h0, w0), r, pad)
+    c_boxes, c_scores, _ = postprocess_det(outs_det, (h0, w0), r, pad)
 
     if len(c_boxes) > 0:
-        return (c_boxes[0][0], c_boxes[0][1], c_boxes[0][2], c_boxes[0][3]), c_scores[0], "crack"
+        box = c_boxes[0]
+        return (box[0], box[1], box[2], box[3]), c_scores[0], "crack"
+
     if len(e_boxes) > 0:
-        return (e_boxes[0][0], e_boxes[0][1], e_boxes[0][2], e_boxes[0][3]), e_scores[0], "erosion"
+        box = e_boxes[0]
+        return (box[0], box[1], box[2], box[3]), e_scores[0], "erosion"
+
     return None
 
-def _save_best(candidates, save_dir):
+def _save_best(candidates: list, save_dir: str):
+    """Write the highest-confidence frame from one lock session to disk."""
     best_img, best_conf, best_class = max(candidates, key=lambda x: x[1])
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:21]
     filename  = os.path.join(save_dir, f"{best_class}_{timestamp}.jpg")
@@ -354,20 +392,39 @@ def main():
 
     print(f"[INFO] Found {len(ports)} serial port(s): {ports}")
 
-    ser_yaw   = None
+    port_yaw = ports[0]
+    port_pitch = ports[1] if len(ports) >= 2 else None
+
+    # Port ordering is not stable across reboots, so confirm the mapping.
+    if len(ports) >= 2:
+        print("\nDetected the following serial ports:")
+        for i, p in enumerate(ports):
+            print(f"  [{i}] {p}")
+
+        print("\nDefault: serial port 0 -> Yaw motor, serial port 1 -> Pitch motor")
+        confirm = input("Use the default assignment? (y/n, press Enter for y): ").strip().lower()
+
+        if confirm == 'n':
+            try:
+                idx_yaw = int(input(f"  Enter the serial port index for Yaw motor (0~{len(ports)-1}): ").strip())
+                idx_pitch = int(input(f"  Enter the serial port index for Pitch motor (0~{len(ports)-1}): ").strip())
+                port_yaw, port_pitch = ports[idx_yaw], ports[idx_pitch]
+            except (ValueError, IndexError):
+                print("Invalid input; falling back to default assignment.")
+                port_yaw, port_pitch = ports[0], ports[1]
+
+    ser_yaw = None
     ser_pitch = None
 
     try:
-        # Pitch-first mapping: first port is pitch, second (if any) is yaw.
-        if len(ports) >= 1:
-            ser_pitch = serial.Serial(ports[0], 115200, timeout=0.1)
-            print(f"--> [PITCH motor] connected to {ports[0]}")
+        ser_yaw = serial.Serial(port_yaw, 115200, timeout=0.1)
+        print(f"--> [YAW  motor] connected to {port_yaw}")
 
-        if len(ports) >= 2:
-            ser_yaw = serial.Serial(ports[1], 115200, timeout=0.1)
-            print(f"--> [YAW  motor] connected to {ports[1]}")
+        if port_pitch is not None:
+            ser_pitch = serial.Serial(port_pitch, 115200, timeout=0.1)
+            print(f"--> [PITCH motor] connected to {port_pitch}")
         else:
-            print("--> [INFO] Single-motor mode — pitch tracking only.")
+            print("--> [INFO] Single-motor mode — yaw tracking only.")
 
         print("[INFO] Waiting for FOC calibration (5 s)...")
         time.sleep(5)
@@ -391,8 +448,9 @@ def main():
 
     print("[INFO] Starting D435 colour stream...")
     pipeline = rs.pipeline()
-    config   = rs.config()
+    config = rs.config()
     config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
+
     try:
         pipeline.start(config)
     except Exception as e:
@@ -402,21 +460,22 @@ def main():
     CENTER_X = 640 / 2
     CENTER_Y = 480 / 2
 
-    photo_candidates  = []
-    last_capture_time = 0.0
-    was_locked        = False
-    unlock_frames     = 0
+    # Candidate buffer for the current lock session.
+    photo_candidates   = []    # (img_copy, conf, class_name)
+    last_capture_time  = 0.0
+    was_locked         = False
+    unlock_frames      = 0
 
-    print("\n[INFO] System ready. (pitch-only test mode)")
+    print("\n[INFO] System ready. (single/dual motor adaptive)")
 
     try:
         while True:
-            frames      = pipeline.wait_for_frames()
+            frames = pipeline.wait_for_frames()
             color_frame = frames.get_color_frame()
             if not color_frame:
                 continue
 
-            raw_image     = np.asanyarray(color_frame.get_data())
+            raw_image    = np.asanyarray(color_frame.get_data())
             display_image = raw_image.copy()
 
             detection_result = run_yolo_inference(raw_image, seg_runner, det_runner)
@@ -425,11 +484,14 @@ def main():
                 (x_min, y_min, x_max, y_max), conf, class_name = detection_result
 
                 box_color = CLASS_COLORS.get(class_name, (0, 255, 255))
+
                 cx = (x_min + x_max) / 2
                 cy = (y_min + y_max) / 2
+
                 err_x = cx - CENTER_X
                 err_y = cy - CENTER_Y
 
+                # Draw annotations on display_image so the saved frame has them too.
                 cv2.rectangle(display_image, (int(x_min), int(y_min)), (int(x_max), int(y_max)), box_color, 2)
                 label = f"{class_name} {conf:.2f}"
                 cv2.putText(display_image, label, (int(x_min), int(y_min) - 10),
@@ -448,8 +510,8 @@ def main():
                     delta_yaw   = err_x * KP_YAW   * DIR_YAW
                     delta_pitch = err_y * KP_PITCH  * DIR_PITCH
 
-                    current_yaw   = max(YAW_MIN,  min(YAW_MAX,   current_yaw   + delta_yaw))
-                    current_pitch = max(PITCH_MIN, min(PITCH_MAX, current_pitch + delta_pitch))
+                    current_yaw   = max(YAW_MIN,   min(YAW_MAX,   current_yaw   + delta_yaw))
+                    current_pitch = max(PITCH_MIN,  min(PITCH_MAX, current_pitch + delta_pitch))
 
                     if ser_yaw:
                         ser_yaw.write(f"T{current_yaw:.4f}\n".encode('utf-8'))
@@ -457,6 +519,7 @@ def main():
                         ser_pitch.write(f"T{current_pitch:.4f}\n".encode('utf-8'))
 
                 else:
+                    # Locked on target: capture at most MAX_PHOTOS_PER_LOCK frames.
                     unlock_frames = 0
                     was_locked    = True
                     current_time  = time.time()
@@ -474,7 +537,7 @@ def main():
             cv2.line(display_image, (int(CENTER_X)-20, int(CENTER_Y)), (int(CENTER_X)+20, int(CENTER_Y)), (0, 255, 0), 2)
             cv2.line(display_image, (int(CENTER_X), int(CENTER_Y)-20), (int(CENTER_X), int(CENTER_Y)+20), (0, 255, 0), 2)
 
-            cv2.imshow("TensorRT YOLO Servoing - PITCH TEST", display_image)
+            cv2.imshow("TensorRT YOLO Servoing", display_image)
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
 
@@ -495,7 +558,6 @@ def main():
             pass
         cv2.destroyAllWindows()
         print("[INFO] System shut down safely.")
-
 
 if __name__ == "__main__":
     main()
